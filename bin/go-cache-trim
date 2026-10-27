@@ -1,0 +1,48 @@
+#!/bin/sh
+# Keep at least MIN_FREE_GIB free on the Data volume by trimming Go build
+# caches in stages: entries unused for 24h, 6h, 1h, then the whole caches.
+# Covers the default cache and agent caches in /private/tmp (*-go-build,
+# *-gocache). Stops at the first stage that brings free space back over the
+# minimum.
+set -u
+
+MIN_FREE_GIB="${MIN_FREE_GIB:-10}"
+VOLUME=/System/Volumes/Data
+GOCACHE="${GOCACHE:-$HOME/Library/Caches/go-build}"
+TMP_CACHES="${TMP_CACHES:-/private/tmp}"
+GO="${GO:-go}"
+
+log() { echo "$(date '+%F %T') $*"; }
+
+free_gib() { df -k "$VOLUME" | awk 'NR==2{print int($4 / 1048576)}'; }
+
+caches() {
+	echo "$GOCACHE"
+	find "$TMP_CACHES" -mindepth 1 -maxdepth 1 -type d \( -name '*-go-build' -o -name '*-gocache' \)
+}
+
+caches_size() { caches | tr '\n' '\0' | xargs -0 du -sch 2>/dev/null | awk 'END{print $1}'; }
+
+free=$(free_gib)
+if [ "$free" -ge "$MIN_FREE_GIB" ]; then
+	log "ok free=${free}G"
+	exit 0
+fi
+
+log "low free=${free}G caches=$(caches_size) in: $(caches | tr '\n' ' ')"
+for age_min in 1440 360 60; do
+	caches | while read -r c; do
+		find "$c" -mindepth 2 -type f -mmin +"$age_min" -delete
+	done
+	free=$(free_gib)
+	log "trimmed unused >${age_min}m free=${free}G caches=$(caches_size)"
+	[ "$free" -ge "$MIN_FREE_GIB" ] && exit 0
+done
+
+cd "$HOME" || exit 1
+caches | while read -r c; do
+	GOCACHE="$c" "$GO" clean -cache
+done
+free=$(free_gib)
+log "cleared all caches free=${free}G"
+[ "$free" -ge "$MIN_FREE_GIB" ] || log "still under ${MIN_FREE_GIB}G: something other than the Go build caches is filling the disk"
